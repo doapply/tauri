@@ -14,7 +14,7 @@ use kuchiki::{traits::TendrilSink, NodeRef};
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 use std::{
-  net::{Ipv4Addr, SocketAddr},
+  net::{IpAddr, SocketAddr},
   path::{Path, PathBuf},
   sync::{mpsc::sync_channel, Arc},
   thread,
@@ -27,20 +27,18 @@ const AUTO_RELOAD_SCRIPT: &str = include_str!("./auto-reload.js");
 
 struct State {
   serve_dir: PathBuf,
+  address: SocketAddr,
   tx: Sender<()>,
 }
 
-pub fn start_dev_server<P: AsRef<Path>>(path: P, port: Option<u16>) -> SocketAddr {
+pub fn start_dev_server<P: AsRef<Path>>(
+  path: P,
+  ip: IpAddr,
+  port: Option<u16>,
+) -> crate::Result<SocketAddr> {
   let serve_dir = path.as_ref().to_path_buf();
-  let server_url = SocketAddr::new(
-    Ipv4Addr::new(127, 0, 0, 1).into(),
-    port.unwrap_or_else(|| {
-      std::env::var("TAURI_DEV_SERVER_PORT")
-        .unwrap_or_else(|_| "1430".to_string())
-        .parse()
-        .unwrap()
-    }),
-  );
+
+  let (server_url_tx, server_url_rx) = std::sync::mpsc::channel();
 
   std::thread::spawn(move || {
     tokio::runtime::Builder::new_current_thread()
@@ -73,7 +71,37 @@ pub fn start_dev_server<P: AsRef<Path>>(path: P, port: Option<u16>) -> SocketAdd
           }
         });
 
-        let state = Arc::new(State { serve_dir, tx });
+        let mut auto_port = false;
+        let mut port = port.unwrap_or_else(|| {
+          std::env::var("TAURI_DEV_SERVER_PORT")
+            .unwrap_or_else(|_| {
+              auto_port = true;
+              "1430".to_string()
+            })
+            .parse()
+            .unwrap()
+        });
+
+        let (server, server_url) = loop {
+          let server_url = SocketAddr::new(ip, port);
+          let server = Server::try_bind(&server_url);
+
+          if !auto_port {
+            break (server, server_url);
+          }
+
+          if server.is_ok() {
+            break (server, server_url);
+          }
+
+          port += 1;
+        };
+
+        let state = Arc::new(State {
+          serve_dir,
+          tx,
+          address: server_url,
+        });
         let router = Router::new()
           .fallback(
             Router::new().nest(
@@ -86,19 +114,29 @@ pub fn start_dev_server<P: AsRef<Path>>(path: P, port: Option<u16>) -> SocketAdd
             ),
           )
           .route(
-            "/_tauri-cli/ws",
+            "/__tauri_cli",
             get(move |ws: WebSocketUpgrade| async move {
               ws.on_upgrade(|socket| async move { ws_handler(socket, state).await })
             }),
           );
-        Server::bind(&server_url)
-          .serve(router.into_make_service())
-          .await
-          .unwrap();
+
+        match server {
+          Ok(server) => {
+            server_url_tx.send(Ok(server_url)).unwrap();
+            server.serve(router.into_make_service()).await.unwrap();
+          }
+          Err(e) => {
+            server_url_tx
+              .send(Err(anyhow::anyhow!(
+                "failed to start development server on {server_url}: {e}"
+              )))
+              .unwrap();
+          }
+        }
       })
   });
 
-  server_url
+  server_url_rx.recv().unwrap()
 }
 
 async fn handler<T>(req: Request<T>, state: Arc<State>) -> impl IntoResponse {
@@ -116,7 +154,7 @@ async fn handler<T>(req: Request<T>, state: Arc<State>) -> impl IntoResponse {
 
   file
     .map(|mut f| {
-      let mime_type = MimeType::parse(&f, uri);
+      let mime_type = MimeType::parse_with_fallback(&f, uri, MimeType::OctetStream);
       if mime_type == MimeType::Html.to_string() {
         let mut document = kuchiki::parse_html().one(String::from_utf8_lossy(&f).into_owned());
         fn with_html_head<F: FnOnce(&NodeRef)>(document: &mut NodeRef, f: F) {
@@ -135,7 +173,10 @@ async fn handler<T>(req: Request<T>, state: Arc<State>) -> impl IntoResponse {
         with_html_head(&mut document, |head| {
           let script_el =
             NodeRef::new_element(QualName::new(None, ns!(html), "script".into()), None);
-          script_el.append(NodeRef::new_text(AUTO_RELOAD_SCRIPT));
+          script_el.append(NodeRef::new_text(AUTO_RELOAD_SCRIPT.replace(
+            "{{reload_url}}",
+            &format!("ws://{}/__tauri_cli", state.address),
+          )));
           head.prepend(script_el);
         });
 
